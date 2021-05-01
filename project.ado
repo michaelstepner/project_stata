@@ -1,4 +1,4 @@
-*! version 3.0.0b4  4dec2020  Robert Picard, picard@netbox.com
+*! version 3.0.0b8  18mar2021  Robert Picard, picard@netbox.com
 *! minor edits by Michael Stepner, software@michaelstepner.com
 program define project
 /*
@@ -12,7 +12,6 @@ reroutes each call to the appropriate local program.
 
 	version 16.0
 
-
 	syntax	[name(name=pname id="Project Name")], ///
 			[					///
 								/// --------- project database ----------------
@@ -21,6 +20,7 @@ reroutes each call to the appropriate local program.
 			plist				/// list of projects and their directory
 			pclear				/// clear a project's record in the dataset of projects
 			cd					/// change Stata's dir to the project directory
+			root				/// store the project directory in the $root global
 								/// --------- project management tasks --------
 			build				/// builds the project (runs the master do-file)
 			list(string)		/// list files in the project
@@ -32,9 +32,7 @@ reroutes each call to the appropriate local program.
 			rmcreated			/// erase all files created by the project
 								/// --------- build directives ----------------
 			do(string)			/// do-file to run
-			original(string)	/// do-file uses a file not created within the project
-			uses(string)		///	do-file uses a file created within the project
-			relies_on(string)	/// a related file not directly used (info, docs, etc.)
+			uses(string)		///	do-file uses a file
 			creates(string)		/// do-file creates a file
 			doinfo				/// returns info about the do-file and current build
 			break				/// to stop execution of a project at a specific point
@@ -43,12 +41,18 @@ reroutes each call to the appropriate local program.
 			TEXTlog             /// log file in plain text format
 			SMCLlog             /// log file in SMCL format
 			relax(string)		/// relax dependency checks for files over (in MB)
+			raw					/// enforce uses() file is original to this project
+			derived				/// enforce uses() file is created by this project
+			reference			/// specify uses() file is referenced by this project
+								/// ----- deprecated build directives ---------
+			original(string)	/// do-file uses a file not created within the project
+			relies_on(string)	/// a related file not directly used (info, docs, etc.)
 			]
 
-
-	local command_list setup setmaster plist pclear cd ///
+	local command_list setup setmaster plist pclear cd root ///
 		build list validate replicate archive share cleanup rmcreated ///
-		do original uses relies_on creates doinfo break
+		do uses creates doinfo break ///
+		original relies_on
 	
 	local nopt 0
 	foreach opt in `command_list' {
@@ -378,6 +382,9 @@ Stata PERSONAL directory.
 		dis as err "Stata's standard {help [M-1] naming:naming convention} for variables and other objects"
 		exit 198
 	}
+	
+	// create Stata PERSONAL directory if it does not yet exist
+	if inlist("`c(os)'","MacOSX","Unix") shell mkdir -p `c(sysdir_personal)'
 
 	
 	local logtype = cond("`textlog'" == "","SMCL","plain text")
@@ -563,28 +570,64 @@ Change Stata's current working directory to the project's directory
 
 --------------------------------------------------------------------------------
 */
-
-	// this is not a build directive
-	exit_if_in_a_build
 	
 	syntax name(name=pname id="Project Name"), cd
 	
+	tempname project_db
+	frame create `project_db'
+	frame `project_db' {
 	
-	preserve
-	
-	
-	get_database_of_projects
+		get_database_of_projects
 
+		qui keep if pname == "`pname'"
+		if _N == 0 {
+			dis as err `"project "`pname'" not found"'
+			exit 459
+		}
+		else {
+			cd "`=path'"
+			return local pwd "`=path'"
+		}
+		
+	}
+	
+end
 
-	qui keep if pname == "`pname'"
-	if _N == 0 {
-		dis as err `"project "`pname'" not found"'
-		exit 459
+program define project_root, rclass
+/*
+--------------------------------------------------------------------------------
+
+Store the project directory in the $root global
+and return an indicator for whether a build is running.
+
+--------------------------------------------------------------------------------
+*/
+	
+	syntax name(name=pname id="Project Name"), root
+	
+	* Print project directory and store in $root global
+	tempname project_db
+	frame create `project_db'
+	frame `project_db' {
+	
+		get_database_of_projects
+
+		qui keep if pname == "`pname'"
+		if _N == 0 {
+			dis as err `"project "`pname'" not found"'
+			exit 459
+		}
+		else {
+			global root "`=path'"
+			di "`=path'"
+		}
+		
 	}
-	else {
-		cd "`=path'"
-		return local pwd "`=path'"
-	}
+	
+	* Return indicator for whether a build is running
+	cap describe using `"$PROJECT_buildtemp"'
+	if (!_rc) return scalar buildrunning=1
+	else return scalar buildrunning=0
 	
 end
 
@@ -688,7 +731,7 @@ Build a project.
 		gen long fdo = .		// fno of do-file
 		gen long odo = .		// fno of do-file that originated the link
 		gen long flink = .		// fno of the linked to file 
-		gen byte linktype = .	// 1 original 2 uses 3 relies_on 4 creates
+		gen byte linktype = .	// 1 uses_raw 2 uses_derived 3 uses_reference 4 creates 5 uses
 		gen long lkcsum = .		// linked file's checksum (from -checksum-)
 		gen double lkflen = .	// linded file's length (from -checksum-)
 		gen lkcvs = .			// -checksum- version
@@ -696,8 +739,8 @@ Build a project.
 		gen int norder = .		// link's order of appearance within the do-file
 		gen byte level = .		// nested do-file level
 		
-		// there are 4 types of links
-		label def linktype_l 1 original 2 uses 3 relies_on 4 creates
+		// there are 5 types of links
+		label def linktype_l 1 raw 2 derived 3 reference 4 creates 5 uses
 		label values linktype linktype_l
 		
 		// label and numeric to string conversion for our printing routines
@@ -766,7 +809,7 @@ Build a project.
 	dis as text _dup(`c(linesize)') "="
 	
 	
-	restore, not	// cancel break hanling
+	restore, not	// cancel break handling
 	
 		
 	// run the master do-file but capture any error / Break key
@@ -859,7 +902,7 @@ This can only be done if the previous build was successful.
 	dis as res  "`: char _dta[end_date]', `: char _dta[end_time]'" _n
 	
 
-	// The master do-file is lined to all files in the most recent build.
+	// The master do-file is linked to all files in the most recent build.
 	// The norder variable is kept to track the order in which each file
 	// was created.
 	qui keep if fdo == 1
@@ -1237,40 +1280,74 @@ Run a do-file from within a build.  The master do-file is called from
 
 	syntax , do(string) [preserve TEXTlog SMCLlog]
 	
-	// This is a build directive; check that we are currently running one
+	// Parse do-file
+	qui get_pathname "`do'"
+	local dofile "`r(fname)'"
+	local fullpath "`r(fullpath)'"
+	
+	// This is a build directive; check whether we are currently running one
 	cap describe using `"$PROJECT_buildtemp"'
 	if _rc {
-		dis as err "no project being built"
-		exit 198
+		dis as text "no project being built -> naively running do-file"
+
+		// Move to the do-file's directory
+		local savepwd "`c(pwd)'"
+		qui cd "`fullpath'"
+		
+		// Start the do-file with a clean slate
+		clear_globals
+		clear
+		mata: mata clear
+		timer clear
+		program drop _all
+		
+		if `c(stata_version)' >= 14 {
+			set rng default
+			set seed_mt64 123456789
+			set seed_kiss32 123456789
+		} 
+		else set seed 123456789
+		
+		// run the do-file; close the do-file if a break/error occured
+		version `c(stata_version)': noisily do "`dofile'"
+				
+		// restore the enclosing do-file's working directory
+		qui cd "`savepwd'"
+		
+		exit
+		
 	}
 	
 	// restore to nothing if error/Break unless user wants its data back
 	if "`preserve'" == "" clear
 	preserve
 
+	// load locals from project build database
+	tempname project_db
+	frame create `project_db'
+	frame `project_db' {
 
-	use `"$PROJECT_buildtemp"', clear
-	local pname  : char _dta[pname]
-	local pdir   : char _dta[pdir]
-	local bdate  : char _dta[date]
-	local btime  : char _dta[time]
-	local plog   : char _dta[plog]
-	local relax  : char _dta[relax]
-	
-	if "`pname'" == "" | "`pdir'" == "" | "`bdate'" == "" | "`btime'" == "" | "`plog'" == ""  | "`relax'" == "" {
-		dis as err "build parameters corrupted - this should never happen"
-		exit 459
+		use `"$PROJECT_buildtemp"', clear
+		local pname  : char _dta[pname]
+		local pdir   : char _dta[pdir]
+		local bdate  : char _dta[date]
+		local btime  : char _dta[time]
+		local plog   : char _dta[plog]
+		local relax  : char _dta[relax]
+		
+		if "`pname'" == "" | "`pdir'" == "" | "`bdate'" == "" | "`btime'" == "" | "`plog'" == ""  | "`relax'" == "" {
+			dis as err "build parameters corrupted - this should never happen"
+			exit 459
+		}
+		
+		local pfiles "`pdir'/`pname'_files.dta"
+		local plinks "`pdir'/`pname'_links.dta"
+		local prompt "project `pname' > "
+
 	}
-	
-	local pfiles "`pdir'/`pname'_files.dta"
-	local plinks "`pdir'/`pname'_links.dta"
-	local prompt "project `pname' > "	
-
+	frame drop `project_db'
 
 	// Force the user to run do-files from within the project directory
-	qui get_pathname "`do'"
-	local dofile "`r(fname)'"
-	local fullpath "`r(fullpath)'"
 	if "`pdir'" == "`fullpath'" local dopath ""
 	else local dopath : subinstr local fullpath "`pdir'/" ""
 	local len_full : length local fullpath
@@ -1298,73 +1375,88 @@ Run a do-file from within a build.  The master do-file is called from
 	local logfile = "`dofstub'.`logext'"
 	
 	
-	// Find the do-file in the project files database. If the do-file is not
-	// yet in the database, use the next available number; that's the number
-	// that will be assigned by the dolink call just before running the do-file
-	// for the first time
-	qui use "`pfiles'", clear
-	gen n = _n
-	sum n if upper(fname) == upper("`dofile'") & ///
-			upper(fpath) == upper("`dopath'"), meanonly
-	if r(N) == 0 {
-		sum fno, meanonly
-		local fdo = cond(mi(r(max)), 1, r(max) + 1)
+	tempname project_files
+	frame create `project_files'
+	frame `project_files' {
+		// Find the do-file in the project files database. If the do-file is not
+		// yet in the database, use the next available number; that's the number
+		// that will be assigned by the dolink call just before running the do-file
+		// for the first time
+		qui use "`pfiles'", clear
+		gen n = _n
+		sum n if upper(fname) == upper("`dofile'") & ///
+				upper(fpath) == upper("`dopath'"), meanonly
+		if r(N) == 0 {
+			sum fno, meanonly
+			local fdo = cond(mi(r(max)), 1, r(max) + 1)
+		}
+		else {
+			local fdo = fno[r(max)]
+		}
+		
+		
+		// Find the file number of the logfile if it exists
+		sum n if upper(fname) == upper("`logfile'") & ///
+				upper(fpath) == upper("`dopath'"), meanonly
+		local flog = fno[r(max)]
 	}
-	else {
-		local fdo = fno[r(max)]
-	}
-	
-	
-	// Find the file number of the logfile if it exists
-	sum n if upper(fname) == upper("`logfile'") & ///
-			upper(fpath) == upper("`dopath'"), meanonly
-	local flog = fno[r(max)]
+	frame drop `project_files'
 
 
 	// Add the do-file to the list of currently active do-files.
 	// Get the file number of the enclosing do-file, missing if this is the master
-	qui use `"$PROJECT_buildtemp"', clear
-	local dolist : char _dta[dolist]
-	gettoken enclosing_do : dolist
-	char _dta[dolist]  `fdo' `dolist'
-	qui save `"$PROJECT_buildtemp"', replace emptyok
-	
-
-	// Do not run the same do-file more than once.
-	qui use "`plinks'", clear
-	capture count if fdo == `fdo' & newlink
-	if r(N) {
-		dis as text "`prompt'" ///
-			as err `"Cannot do "`dofile'" more than once per build"'
-		exit 119
+	tempname project_db
+	frame create `project_db'
+	frame `project_db' {
+		qui use `"$PROJECT_buildtemp"', clear
+		local dolist : char _dta[dolist]
+		gettoken enclosing_do : dolist
+		char _dta[dolist]  `fdo' `dolist'
+		qui save `"$PROJECT_buildtemp"', replace emptyok
 	}
+	frame drop `project_db'
 
-	
-	// Another do-file should not be linked to this one
-	qui count if flink == `fdo' & newlink
-	if r(N) {
-		dis as text "`prompt'" ///
-			as err `"Another do-file is linked to "`dofile'""'
-		exit 119
+	tempname project_links
+	frame create `project_links'
+	frame `project_links' {
+
+		// Do not run the same do-file more than once.
+		qui use "`plinks'", clear
+		capture count if fdo == `fdo' & newlink
+		if r(N) {
+			dis as text "`prompt'" ///
+				as err `"Cannot do "`dofile'" more than once per build"'
+			exit 119
+		}
+
+		
+		// Another do-file should not be linked to this one
+		qui count if flink == `fdo' & newlink
+		if r(N) {
+			dis as text "`prompt'" ///
+				as err `"Another do-file is linked to "`dofile'""'
+			exit 119
+		}
+		
+		
+		// If this do-file successfully completed its previous run, it will have a
+		// link to its logfile. If that's the case, we may not have to run it again.
+		// Save copies of its previous links so that we may check.
+		qui keep if fdo == `fdo'
+		qui count if flink == `flog'
+		local do_it = r(N) == 0
+		if !`do_it' {
+			tempfile dolinks
+			qui save "`dolinks'"
+		}
+
+		// Clear the links from the previous build
+		qui use "`plinks'", clear
+		qui drop if fdo == `fdo'
+		qui save "`plinks'", replace emptyok
 	}
-	
-	
-	// If this do-file successfully completed its previous run, it will have a
-	// link to its logfile. If that's the case, we may not have to run it again.
-	// Save copies of its previous links so that we may check.
-	qui keep if fdo == `fdo'
-	qui count if flink == `flog'
-	local do_it = r(N) == 0
-	if !`do_it' {
-		tempfile dolinks
-		qui save "`dolinks'"
-	}
+	frame drop `project_links'
 
-
-	// Clear the links from the previous build
-	qui use "`plinks'", clear
-	qui drop if fdo == `fdo'
-	qui save "`plinks'", replace emptyok
 		
 	
 	if !`do_it' {
@@ -1532,18 +1624,18 @@ Run a do-file from within a build.  The master do-file is called from
 			qui count if (linktype0 == 1 | linktype0 == 3) & linktype == 4
 			if r(N) {	
 				dis as text "`prompt'" ///
-					as err  "skipped do-file (or nested do-file within) contains"
+					as err  "skipped do-file (or nested do-file within) uses"
 				dis as text "`prompt'" ///
-					as err  "a -relies_on()- or -original() build directive but " ///
-							"linked file is already created by the project"
+					as err  "a file specified as raw or reference but " ///
+							"that linked file is already created by the project"
 				exit 119
 			}
 			qui count if linktype0 == 2 & linktype != 4
 			if r(N) {	
 				dis as text "`prompt'" ///
-					as err  "skipped do-file (or nested do-file within) contains"
+					as err  "skipped do-file (or nested do-file within) uses"
 				dis as text "`prompt'" ///
-					as err  "a -uses()- build directive but " ///
+					as err  "a file specified as derived but " ///
 					"no prior -creates()- build directive found"
 				exit 119
 			}
@@ -1620,41 +1712,8 @@ all upstream do-file) be rerun.
 
 	syntax , original(string) [preserve]
 	
-	if ("`preserve'"!="") di as text "project: 'preserve' option is no longer necessary in build directives"
-		
-	tempname project_db
-	frame create `project_db'
-	frame `project_db': project_dolink , linktype(1) linkfile("`original'")
+	project_uses, uses("`original'") `preserve' raw
 			
-end
-
-
-program define project_uses
-/*
---------------------------------------------------------------------------------
-
-The uses(filename) build directive is used to link the currently running
-do-file (and all upstream do-files) to a file that was created by the 
-project. The linked file is used in some way and therefore the results of the 
-project could change (including log files) if the linked file changes.
-Therefore any change to the linked file will require that the do-file (and
-all upstream do-file) be rerun 
-
-Note that is it not necessary to declare such a link in the do-file that
-actually creates the linked file. This is typically used with files that are
-created by a previously run do-file.
-
---------------------------------------------------------------------------------
-*/
-
-	syntax , uses(string) [preserve]
-	
-	if ("`preserve'"!="") di as text "project: 'preserve' option is no longer necessary in build directives"
-		
-	tempname project_db
-	frame create `project_db'
-	frame `project_db': project_dolink , linktype(2) linkfile("`uses'")
-		
 end
 
 
@@ -1682,12 +1741,56 @@ instead of moving them to an archive.
 
 	syntax , relies_on(string) [preserve]
 	
-	if ("`preserve'"!="") di as text "project: 'preserve' option is no longer necessary in build directives"
-		
+	project_uses, uses("`relies_on'") `preserve' reference
+
+end
+
+
+program define project_uses
+/*
+--------------------------------------------------------------------------------
+
+The uses(filename) build directive is used to link the currently running
+do-file (and all upstream do-files) to a file that was created by the 
+project. The linked file is used in some way and therefore the results of the 
+project could change (including log files) if the linked file changes.
+Therefore any change to the linked file will require that the do-file (and
+all upstream do-file) be rerun 
+
+Note that is it not necessary to declare such a link in the do-file that
+actually creates the linked file. This is typically used with files that are
+created by a previously run do-file.
+
+--------------------------------------------------------------------------------
+*/
+
+	syntax , uses(string) [preserve raw derived reference]
+	
+	if ("`preserve'"!="") di as text "project > {bf:preserve} option is no longer necessary in build directives"
+	
+	local option_list raw derived reference
+	
+	local nopt 0
+	foreach opt in `option_list' {
+		if "``opt''" ~= "" {
+			local myopt `opt'
+			local ++nopt
+		}
+	}
+	
+	if `nopt' > 1 {
+		dis as err "options {bf:`option_list'} cannot be combined"
+		exit 198
+	}
+	
 	tempname project_db
 	frame create `project_db'
-	frame `project_db': project_dolink , linktype(3) linkfile("`relies_on'")	
-
+	
+	if ("`raw'"!="") frame `project_db': project_dolink , linktype(1) linkfile("`uses'")
+	else if ("`reference'"!="") frame `project_db': project_dolink , linktype(3) linkfile("`uses'")
+	else if ("`derived'"!="") frame `project_db': project_dolink , linktype(2) linkfile("`uses'")
+	else frame `project_db': project_dolink , linktype(5) linkfile("`uses'")  // unspecified
+		
 end
 
 
@@ -1706,13 +1809,13 @@ file created by the project, e.g. -outsheet-, -outfile-, -graph-,
 
 	syntax , creates(string) [preserve]
 	
-	if ("`preserve'"!="") di as text "project: 'preserve' option is no longer necessary in build directives"
+	if ("`preserve'"!="") di as text "project > {bf:preserve} option is no longer necessary in build directives"
 	
 	// if linking to a created dta file, strip timestamp for binary stability
-	capture dtaversion "`creates'"
-	if _rc==0 {
-		if (`r(version)'==118) _strip_dta_timestamp using "`creates'"
-	}
+// 	capture dtaversion "`creates'"
+// 	if _rc==0 {
+// 		if (`r(version)'==118) _strip_dta_timestamp using "`creates'"
+// 	}
 		
 	tempname project_db
 	frame create `project_db'
@@ -1726,8 +1829,16 @@ program define project_dolink, rclass
 --------------------------------------------------------------------------------
 
 Link the currently running do-file to a file. This program is called from
-project_do, project_original, project_uses, project_relies_on, and
-project_creates. The calling programs handle -preserve-
+project_do, project_uses, and project_creates. The calling programs handle
+the use of -preserve- or frames to avoid overwriting data.
+
+There are 5 potential values for linktype:
+
+	1 = uses raw
+	2 = uses derived
+	3 = uses reference
+	4 = creates
+	5 = uses [could be raw, derived or reference]
 
 --------------------------------------------------------------------------------
 */
@@ -1738,8 +1849,8 @@ project_creates. The calling programs handle -preserve-
 	// This is a build directive; check that we are currently running one
 	cap describe using `"$PROJECT_buildtemp"'
 	if _rc {
-		dis as err "no project being built"
-		exit 198
+		dis "project > no build running, build directive ignored"
+		exit
 	}
 	
 	use `"$PROJECT_buildtemp"', clear
@@ -1879,10 +1990,10 @@ project_creates. The calling programs handle -preserve-
 			qui count if flink == `flink' & linktype == 4
 			if r(N) {	
 				dis as text "`prompt'" ///
-					as err  "relies_on or original file is " ///
+					as err  "raw file or reference is " ///
 							"created by the project;"
 				dis as text "`prompt'" ///
-					as err `"try: project , uses(`anything') instead."'
+					as err `"instead try: {bf:project , uses() derived}"'
 				exit 119
 			}
 		}
@@ -1898,7 +2009,8 @@ project_creates. The calling programs handle -preserve-
 				dis as text "`prompt'" ///
 					as err  "file is not created by the project;"
 				dis as text "`prompt'" ///
-					as err  `"try: project , original(`anything') instead."'
+					as err  `"instead try: {bf:project , uses() raw}"'
+					as err  `"     or try: {bf:project , uses() reference}"'
 				exit 119
 			}
 		}
@@ -1950,7 +2062,7 @@ project_creates. The calling programs handle -preserve-
 		
 
 	// Display link info
-	local linktype : word `linktype' of uses_original uses relies_on creates
+	local linktype : word `linktype' of uses_raw uses_derived uses_reference creates uses
 	local linktype : subinstr local linktype "_" " "
 	local scsum `: dis %12.0f `csum''
 	local sflen `: dis %17.0f `flen''
@@ -1969,84 +2081,79 @@ program define project_doinfo, rclass
 The doinfo build directive is used to get information about the current do-file 
 and the status of the build. 
 
-The default is to not to preserve the use data while this program performs its
-functions. The -preserve- option can be used to overide the default behavior.
-
 --------------------------------------------------------------------------------
 */
 
 	syntax , doinfo [preserve]
 	
 	
-	// This is a build directive; check that we are currently running one
+	// This is a build directive; enforce that we are currently running one
 	cap describe using `"$PROJECT_buildtemp"'
 	if _rc {
 		dis as err "no project being built"
 		exit 198
 	}
 	
-	// restore to nothing if error/Break unless user wants its data back
-	if "`preserve'" == "" clear
-	else {
-		tempname hold
-		cap estimates store `hold'
-	}
-	preserve
-
-	use `"$PROJECT_buildtemp"', clear
-	local pname  : char _dta[pname]
-	local pdir   : char _dta[pdir]
-	local dolist : char _dta[dolist]
-	local bdate  : char _dta[date]
-	local bdate  : dis %d `bdate'
-	local btime  : char _dta[time]
+	if ("`preserve'"!="") di as text "project > {bf:preserve} option is no longer necessary in build directives"
 	
-	if "`pname'" == "" | "`pdir'" == "" | "`bdate'" == "" | "`btime'" == "" {
-		dis as err "build parameters corrupted - this should never happen"
-		exit 459
-	}
-	
-	local pfiles "`pdir'/`pname'_files.dta"
-	local plinks "`pdir'/`pname'_links.dta"
-	local prompt "project `pname' > "
-
-
-	dis as txt "`prompt'Project Name: " as res "`pname'"
-	dis as txt "`prompt'Project Dir.: " as res "`pdir'"
-	dis as txt "`prompt'Build start : " ///
-		as res  "`bdate', `btime'" as text ""
+	tempname project_db
+	frame create `project_db'
+	frame `project_db' {
 		
-
-	gettoken current_do other_do : dolist
-	
-	qui use "`pfiles'", clear
-	gen n = _n
-	sum n if fno == `current_do', meanonly
-	local nobs = r(min)
-	local dofile = fname[`nobs']
-	if regexm("`dofile'","(.*)\.do$") local dofstub = regexs(1)
-	dis as txt "`prompt'Do-file Name: " as res "`dofile'"
-	
-	if !mi("`other_do'") {
-		dis as txt "`prompt'Enclosing do-files:"
-		foreach fdo of numlist `other_do' {
-			sum n if fno == `fdo', meanonly
-			local nobs = r(min)
-			local fname = fname[`nobs']
-			local fpath = fpath[`nobs']
-			dis as txt "`prompt'    " _cont
-			if !mi("`fpath'") dis as res "`fpath'/`fname'"
-			else dis as res "`fname'"
+		use `"$PROJECT_buildtemp"', clear
+		local pname  : char _dta[pname]
+		local pdir   : char _dta[pdir]
+		local dolist : char _dta[dolist]
+		local bdate  : char _dta[date]
+		local bdate  : dis %d `bdate'
+		local btime  : char _dta[time]
+		
+		if "`pname'" == "" | "`pdir'" == "" | "`bdate'" == "" | "`btime'" == "" {
+			dis as err "build parameters corrupted - this should never happen"
+			exit 459
 		}
+		
+		local pfiles "`pdir'/`pname'_files.dta"
+		local plinks "`pdir'/`pname'_links.dta"
+		local prompt "project `pname' > "
+
+
+		dis as txt "`prompt'Project Name: " as res "`pname'"
+		dis as txt "`prompt'Project Dir.: " as res "`pdir'"
+		dis as txt "`prompt'Build start : " ///
+			as res  "`bdate', `btime'" as text ""
+			
+
+		gettoken current_do other_do : dolist
+		
+		qui use "`pfiles'", clear
+		gen n = _n
+		sum n if fno == `current_do', meanonly
+		local nobs = r(min)
+		local dofile = fname[`nobs']
+		if regexm("`dofile'","(.*)\.do$") local dofstub = regexs(1)
+		dis as txt "`prompt'Do-file Name: " as res "`dofile'"
+		
+		if !mi("`other_do'") {
+			dis as txt "`prompt'Enclosing do-files:"
+			foreach fdo of numlist `other_do' {
+				sum n if fno == `fdo', meanonly
+				local nobs = r(min)
+				local fname = fname[`nobs']
+				local fpath = fpath[`nobs']
+				dis as txt "`prompt'    " _cont
+				if !mi("`fpath'") dis as res "`fpath'/`fname'"
+				else dis as res "`fname'"
+			}
+		}
+		
+		return local pname "`pname'"
+		return local pdir  "`pdir'"
+		return local bdate "`bdate'"
+		return local btime "`btime'"
+		return local dofile "`dofstub'"
+		
 	}
-	
-	return local pname "`pname'"
-	return local pdir  "`pdir'"
-	return local bdate "`bdate'"
-	return local btime "`btime'"
-	return local dofile "`dofstub'"
-	
-	if "`preserve'" != "" cap estimates restore `hold'
 
 end
 
@@ -2168,11 +2275,11 @@ manually changed or if there is a bug in this program.
 		exit 459
 	}	
 
-	// a file is created (4) before it is used (2)
+	// a file is created (4) before it is used (2 or 5)
 	sort fdo flink norder
 	capture by fdo flink: assert _n == 1 if linktype == 4
 	local myrc = _rc
-	capture by fdo flink: assert linktype == 2 if linktype[1] == 4 & _n > 1
+	capture by fdo flink: assert linktype == 2 | linktype == 5 if linktype[1] == 4 & _n > 1
 	local myrc = `myrc' + _rc
 	if `myrc' {
 		dis as err  "Inconsistent linktype"
@@ -2725,7 +2832,7 @@ the build could be skipped the next time around.
 	sort flink norder
 	qui by flink: keep if _n == 1
 	
-	// Drop files that are created by the project is requested
+	// Drop files that are created by the project if requested
 	if "`created'" == "nocreated" qui drop if linktype == 4
 	
 	// get file information for files linked to in the most recent build
@@ -3491,14 +3598,14 @@ created.
 
 	
 	// Flag other types; type "uses" is always trumped by "creates"
-	qui replace ftype  = 3 if mi(ftype) & linktype == 1
+	qui replace ftype  = 3 if mi(ftype) & (linktype == 1 | linktype == 5)
 	qui replace ftype  = 4 if linktype == 3
 	qui replace ftype  = 5 if mi(ftype) & linktype == 4
 	
 	local title1 Do-Files
 	local title2 Log Files
-	local title3 Original Files used (except do-files)
-	local title4 Original Files that are relied upon
+	local title3 Raw Files used (except do-files)
+	local title4 Reference Files relied upon
 	local title5 Files created (except log files)
 	
 
@@ -3759,7 +3866,7 @@ List project files alphabetically with a list of all do-files that link to them.
 	// file's name first and then the records from do-files that originated
 	// the link. Put "uses" link after the "creates" link.
 	gen dofile = fdo != .
-	gen uses = linktype == 2
+	gen uses = linktype == 2 | linktype == 5
 	sort flink dofile uses fname fpath
 	by flink: gen upfname = upper(fname[1])
 	qui by flink: gen upfpath = upper(fpath[1])
@@ -4133,7 +4240,7 @@ around -checksum- that returns the correct file size.
 	
 end
 
-
+/*
 program _strip_dta_timestamp
 	/*** Replaces the timestamp in a dta file with "1 Jan 2020 12:00".
 		 Doing so improves the binary stability of the saved dta file.
